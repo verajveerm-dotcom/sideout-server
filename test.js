@@ -1,5 +1,6 @@
 // Run with: npm test   (starts the server on a free port with short timers and checks every feature)
 process.env.RECONNECT_SEC = '1.5';
+process.env.BG_RECONNECT_SEC = '4';
 process.env.PARTY_TTL_MIN = String(6 / 60);   // 6 seconds, so expiry can be tested quickly
 process.env.CREATE_PER_MIN = '30';
 const { io: connect } = require('socket.io-client');
@@ -71,10 +72,22 @@ const V = 2;
   ok(!!(await relay2), 'messages flow again after the rejoin');
   ok((await ask(x, 'rejoin', { code: c.code, role: 'guest', tab: 'someoneelse' })).error === 'not_found', 'a stranger cannot take over a seat');
 
+  console.log('Switched apps');
+  const leftOn = ms => new Promise(res => { const f = d => { if (d && d.status === 'left') { h.off('peer', f); res(d); } }; h.on('peer', f); setTimeout(() => { h.off('peer', f); res(null); }, ms); });
+  const bgSent = next(h, 'pkt'); g2.emit('pkt', { k: 'd', n: 4, d: { t: 'bg', hidden: true } }); await bgSent;
+  const early = leftOn(2500); g2.close();
+  ok((await early) === null, 'a player who switched apps keeps the seat past the normal window');
+  const g4 = await client();
+  ok((await ask(g4, 'rejoin', { code: c.code, role: 'guest', tab: gt })).ok, 'and can still rejoin');
+  const bgBack = next(h, 'pkt'); g4.emit('pkt', { k: 'd', n: 5, d: { t: 'bg', hidden: false } }); await bgBack;
+
   console.log('Forfeit');
-  const leftEv = new Promise(res => { const f = d => { if (d && d.status === 'left') { h.off('peer', f); res(d); } }; h.on('peer', f); setTimeout(() => res(null), 4000); });
-  g2.close();
+  const leftEv = leftOn(4000);
+  g4.close();
   ok(((await leftEv) || {}).status === 'left', 'guest who stays away for the reconnect window forfeits');
+  const g5 = await client();
+  ok((await ask(g5, 'rejoin', { code: c.code, role: 'guest', tab: gt })).error === 'forfeit', 'coming back too late says "forfeit", not "not found"');
+  g5.close();
 
   console.log('Host leaving');
   const h3 = await client(), g3 = await client();

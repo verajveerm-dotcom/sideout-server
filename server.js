@@ -9,12 +9,14 @@ const PORT = Number(process.env.PORT || 3000);
 const ORIGINS = (process.env.ALLOWED_ORIGINS || '*').split(',').map(s => s.trim()).filter(Boolean);
 const PARTY_TTL_MS = Number(process.env.PARTY_TTL_MIN || 15) * 60e3;      // inactivity before a party expires
 const RECONNECT_MS = Number(process.env.RECONNECT_SEC || 30) * 1e3;       // time to come back before a forfeit
+const BG_RECONNECT_MS = Number(process.env.BG_RECONNECT_SEC || 90) * 1e3; // same, for a player who switched apps (the game shows these too)
 const CREATE_PER_MIN = Number(process.env.CREATE_PER_MIN || 10);         // party creations per minute per address
 const NET_V = 2;
 const CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';                     // no 0/O, 1/I/L
 const BAD = ['fuck','shit','bitch','cunt','nigg','fag','dick','cock','pussy','slut','whore','rape','nazi','retard','twat','wank'];
 
 const parties = new Map();   // code -> party
+const forfeits = new Map();  // 'CODE:tab' -> {at, why: 'forfeit'|'won'}, so a player who comes back after a forfeit hears why
 const queue = [];            // quick match: [{sid, tab, name, at}]
 const recentWaits = [];
 
@@ -100,9 +102,9 @@ io.on('connection', socket => {
   }));
   socket.on('rejoin', safe((d, ack) => {
     const p = parties.get(normCode(d.code)), role = d.role === 'host' ? 'host' : 'guest';
-    if (!p || p.closed || !seat(p, role) || seat(p, role).tab !== d.tab) return ack({ error: 'not_found' });
+    if (!p || p.closed || !seat(p, role) || seat(p, role).tab !== d.tab) return ack({ error: (forfeits.get(normCode(d.code) + ':' + d.tab) || {}).why || 'not_found' });
     attach(socket, p, role); const o = seat(p, other(role));
-    ack({ ok: true, peerOnline: !!(o && o.online), snap: p.snap || null });
+    ack({ ok: true, peerOnline: !!(o && o.online), snap: p.snap || null, result: p.result || null });
   }));
   socket.on('pkt', pkt => {
     if (!allow() || !validPkt(pkt)) return;
@@ -110,7 +112,8 @@ io.on('connection', socket => {
     const role = socket.data.role, to = seat(p, other(role)); touch(p);
     if (pkt.k === 'd') {
       const t = pkt.d.t;
-      if (t === 'start') { if (role !== 'host') return; p.state = 'playing'; p.reports = {}; }
+      if (t === 'start') { if (role !== 'host') return; p.state = 'playing'; p.reports = {}; p.result = null; for (const r of ['host', 'guest']) if (seat(p, r)) seat(p, r).bg = false; }
+      if (t === 'bg' && !pkt.d.req) seat(p, role).bg = !!pkt.d.hidden;   // switched apps: a longer reconnect window
       if (t === 'rally') { if (role !== 'host') return; p.score = pkt.d.score; }   // the host reports, the server keeps the authoritative tally
     }
     if (to && to.sid) io.to(to.sid).emit('pkt', pkt);
@@ -131,11 +134,13 @@ io.on('connection', socket => {
     const i = queue.findIndex(q => q.sid === socket.id); if (i >= 0) queue.splice(i, 1);
     const p = party(); if (!p) return; const role = socket.data.role, s = seat(p, role); if (!s || s.sid !== socket.id) return;
     s.online = false; s.sid = null; sendTo(p, other(role), 'peer', { status: 'offline' });
-    // lobby: a host who doesn't come back closes the party; in a match the player gets 30 seconds, then forfeits
-    const grace = p.state === 'playing' ? RECONNECT_MS : role === 'host' ? 10e3 : RECONNECT_MS;
+    // lobby: a host who doesn't come back closes the party; in a match the player gets 30 seconds (90 if they switched
+    // apps, matching the countdown the other player sees), then forfeits
+    const grace = p.state === 'playing' ? (s.bg ? BG_RECONNECT_MS : RECONNECT_MS) : role === 'host' ? 10e3 : RECONNECT_MS;
     s.timer = setTimeout(() => {
       if (s.online) return;
-      if (p.state === 'playing') { p.result = { winner: other(role), forfeit: true }; sendTo(p, other(role), 'peer', { status: 'left' }); }
+      if (p.state === 'playing') { p.result = { winner: other(role), forfeit: true }; const o = seat(p, other(role)), now = Date.now();
+        forfeits.set(p.code + ':' + s.tab, { at: now, why: 'forfeit' }); if (o) forfeits.set(p.code + ':' + o.tab, { at: now, why: 'won' }); sendTo(p, other(role), 'peer', { status: 'left' }); }
       if (role === 'host') closeParty(p, 'host_left'); else { p.guest = null; p.state = 'lobby'; sendTo(p, 'host', 'peer', { status: 'left' }); }
     }, grace);
   });
@@ -162,6 +167,7 @@ function matchQueue() {
 setInterval(() => {
   const now = Date.now();
   for (const p of parties.values()) if (now - p.touched > PARTY_TTL_MS) closeParty(p, 'expired');
+  for (const [k, f] of forfeits) if (now - f.at > PARTY_TTL_MS) forfeits.delete(k);
   for (let i = queue.length - 1; i >= 0; i--) if (!io.sockets.sockets.get(queue[i].sid) || now - queue[i].at > 10 * 60e3) queue.splice(i, 1);
 }, Math.min(30e3, Math.max(250, PARTY_TTL_MS / 3))).unref();
 
